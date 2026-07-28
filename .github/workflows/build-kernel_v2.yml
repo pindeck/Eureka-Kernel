@@ -1,0 +1,224 @@
+name: Build Kernel v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: 'Kernel defconfig to use'
+        required: false
+        default: 'exynos7885-a10_defconfig'
+      proton_ref:
+        description: 'Proton clang ref (tag/branch/commit)'
+        required: false
+        default: 'master'
+
+concurrency:
+  group: build-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    env:
+      CCACHE_COMPILERCHECK: "clang --version"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_MAXSIZE: "10G"
+      CCACHE_HARDLINK: "true"
+      KERNEL_DEFCONFIG: ${{ github.event.inputs.defconfig || 'exynos7885-a10_defconfig' }}
+      PROTON_REF: ${{ github.event.inputs.proton_ref || 'master' }}
+      KSU_REF: "v1.0.8"
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 100
+
+    - name: Initialize submodules
+      run: |
+        git submodule update --init --recursive
+
+    - name: Setup KernelSU-Next (pinned)
+      run: |
+        set -euo pipefail
+        echo "Setting up KernelSU-Next pinned to ${KSU_REF}"
+        rm -rf KernelSU-Next KernelSU drivers/kernelsu || true
+        # Clone from next branch and checkout pinned tag
+        git clone --depth=1 https://github.com/KernelSU-Next/KernelSU-Next -b next KernelSU-Next-temp || (sleep 5 && git clone --depth=1 https://github.com/KernelSU-Next/KernelSU-Next -b next KernelSU-Next-temp)
+        cd KernelSU-Next-temp
+        git fetch --tags --depth=1 || true
+        git checkout ${KSU_REF}
+        # Copy drivers into tree
+        if [ -d drivers/kernelsu ]; then
+          mkdir -p ../drivers
+          cp -r drivers/kernelsu ../drivers/kernelsu
+        else
+          echo "drivers/kernelsu not found in KernelSU-Next at ${KSU_REF}" >&2
+          exit 1
+        fi
+        cd ..
+        rm -rf KernelSU-Next-temp
+        ls -la drivers/kernelsu || echo "Kconfig not found"
+
+    - name: Cache proton-clang
+      uses: actions/cache@v3
+      id: cache-proton
+      with:
+        path: proton-clang
+        key: proton-clang-${{ runner.os }}-${{ env.PROTON_REF }}-${{ hashFiles('.github/workflows/build-kernel.yml') }}
+        restore-keys: |
+          proton-clang-${{ runner.os }}-${{ env.PROTON_REF }}-
+          proton-clang-${{ runner.os }}-
+
+    - name: Cache APT packages
+      uses: actions/cache@v3
+      with:
+        path: /var/cache/apt/archives
+        key: apt-cache-${{ runner.os }}-${{ hashFiles('.github/workflows/build-kernel.yml') }}
+        restore-keys: |
+          apt-cache-${{ runner.os }}-
+
+    - name: Set up ccache action
+      uses: hendrikmuhs/ccache-action@v1.2
+
+    - name: Cache ccache directory
+      uses: actions/cache@v3
+      with:
+        path: ~/.ccache
+        key: ccache-${{ runner.os }}-${{ env.KERNEL_DEFCONFIG }}-${{ hashFiles('.github/workflows/build-kernel.yml') }}
+        restore-keys: |
+          ccache-${{ runner.os }}-${{ env.KERNEL_DEFCONFIG }}-
+          ccache-${{ runner.os }}-
+
+    - name: Install dependencies
+      run: |
+        set -euo pipefail
+        sudo apt-get update -y
+        sudo apt install -y \
+          gcc-aarch64-linux-gnu \
+          gcc-arm-linux-gnueabi \
+          binutils make python3 python2 libssl-dev build-essential \
+          bc bison flex unzip ca-certificates xz-utils \
+          mkbootimg cpio device-tree-compiler git git-lfs
+        # Only download proton-clang if not cached
+        if [ "${{ steps.cache-proton.outputs.cache-hit }}" != 'true' ]; then
+          rm -rf proton-clang
+          git clone https://github.com/kdrag0n/proton-clang --depth=1 -b master proton-clang || (sleep 5 && git clone https://github.com/kdrag0n/proton-clang --depth=1 -b master proton-clang)
+          cd proton-clang
+          if [ "${PROTON_REF}" != "master" ]; then
+            git fetch --tags --depth=1 || true
+            git checkout ${PROTON_REF}
+          fi
+          cd ..
+        fi
+        # Only clean configuration files in O=out once; keep incremental build speed
+        make mrproper || true
+
+    - name: GetTime
+      id: get_time
+      run: |
+        echo "TIME=$(TZ=UTC+7 date +%m%d%H%M)" >> $GITHUB_OUTPUT
+
+    - name: Build Kernel
+      run: |
+        set -euo pipefail
+        echo "Starting kernel build"
+        export PROTON_PATH=$(pwd)/proton-clang/bin
+        export PATH=$PROTON_PATH:$PATH
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export CLANG_TRIPLE=aarch64-linux-gnu-
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+        export CC="ccache clang"
+        # Use GNU ld instead of lld to avoid --lto-O3 issues
+        export LD=aarch64-linux-gnu-ld
+        export AR=llvm-ar
+        export NM=llvm-nm
+        export OBJDUMP=llvm-objdump
+        export OBJCOPY=llvm-objcopy
+        export STRIP=llvm-strip
+        export KCFLAGS=-w
+        export ANDROID_MAJOR_VERSION=r
+        # Disable LTO flags to prevent linker errors
+        export KBUILD_LDFLAGS=""
+
+        export KBUILD_BUILD_USER="CI"
+        export KBUILD_BUILD_HOST="github-actions"
+        export LOCALVERSION="-R15-OneUI-KSUN-${{ github.run_number }}-${{ steps.get_time.outputs.TIME }}"
+
+        # Ensure defconfig is applied
+        make O=out ${KERNEL_DEFCONFIG}
+        scripts/config --file out/.config -d LTO -d LTO_CLANG -d CFI_CLANG || true
+        scripts/config --file out/.config -e ARCH_SUNXI -e MACH_SUN4I || true
+        make O=out olddefconfig
+
+        # Build and capture log. Fail if build fails and keep log for diagnostics.
+        if ! make O=out -j$(nproc --all) 2>&1 | tee build.log; then
+          echo "Build failed; showing last 200 lines:" >&2
+          tail -n 200 build.log
+          exit 1
+        fi
+
+    - name: Package kernel (strict, with diagnostics)
+      run: |
+        set -euo pipefail
+        echo "=== Build output listing ==="
+        if [ -d out/arch/arm64/boot ]; then
+          ls -al out/arch/arm64/boot || true
+        else
+          echo "ERROR: out/arch/arm64/boot not found" >&2
+        fi
+
+        IMAGE_PATH=""
+        for f in \
+          out/arch/arm64/boot/Image.gz-dtb \
+          out/arch/arm64/boot/Image-dtb \
+          out/arch/arm64/boot/Image.gz \
+          out/arch/arm64/boot/Image \
+          out/arch/arm64/boot/zImage; do
+          if [ -f "$f" ]; then
+            IMAGE_PATH="$f"
+            break
+          fi
+        done
+
+        echo "Detected image: ${IMAGE_PATH:-<none>}"
+
+        if [ -z "$IMAGE_PATH" ]; then
+          echo "No kernel image found in out/arch/arm64/boot — failing build and saving debug data"
+          tar -czf build-debug.tar.gz build.log out || true
+          ls -al build-debug.tar.gz || true
+          exit 1
+        fi
+
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3 -b master AnyKernel3
+        rm -rf AnyKernel3/.git AnyKernel3/.github AnyKernel3/LICENSE AnyKernel3/README.md || true
+        # Use custom anykernel.sh if present in repo
+        if [ -f anykernel.sh ]; then
+          cp anykernel.sh AnyKernel3/anykernel.sh
+        fi
+
+        # Copy the detected image into AnyKernel3 using its basename
+        cp "$IMAGE_PATH" AnyKernel3/$(basename "$IMAGE_PATH")
+        if [ -f out/arch/arm64/boot/dtbo.img ]; then
+          cp out/arch/arm64/boot/dtbo.img AnyKernel3/dtbo.img
+        fi
+
+    - name: Upload kernel artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: R15-OneUI-KSUN-${{ github.run_number }}
+        path: AnyKernel3/
+
+    - name: Upload debug artifacts (always)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-debug-${{ github.run_number }}
+        path: |
+          build.log
+          build-debug.tar.gz
+          AnyKernel3/
