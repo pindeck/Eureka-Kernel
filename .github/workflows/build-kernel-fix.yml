@@ -27,7 +27,7 @@ jobs:
       CCACHE_MAXSIZE: "2G"
       CCACHE_HARDLINK: "true"
       # Fixed KERNEL_DEFCONFIG for Samsung Galaxy A10
-      KERNEL_DEFCONFIG: "exynos7885-a10_defconfig"
+      KERNEL_DEFCONFIG: "OLD_exynos7885-a10_defconfig"
       
     steps:
     - name: Checkout
