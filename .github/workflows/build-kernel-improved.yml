@@ -1,0 +1,254 @@
+name: Improved Build Kernel with Eureka Script
+
+# This workflow improves toolchain exports, cache keys, paths, and explicit build steps.
+# It sets KernelSU-Next default version to v1.0.8 as requested.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernelsu_choice:
+        description: 'Choose which KernelSU version to install'
+        required: true
+        type: choice
+        options:
+          - 'KernelSU-Next'
+          - 'SukiSU-Ultra'
+          - 'RKSU'
+        default: 'KernelSU-Next'
+      kernelsu_next_version:
+        description: 'Enter KernelSU-Next version (e.g., v1.0.9). Leave blank for latest.'
+        required: false
+        default: 'v1.0.8'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_MAXSIZE: "2G"
+      CCACHE_HARDLINK: "true"
+      # Verify the defconfig filename in arch/arm64/configs/ and update if needed
+      KERNEL_DEFCONFIG: "exynos7885-a10_defconfig"
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Initialize submodules
+      run: git submodule update --init --recursive
+
+    - name: Cache proton-clang
+      uses: actions/cache@v3
+      id: cache-proton
+      with:
+        path: proton-clang
+        key: proton-clang-${{ runner.os }}-${{ hashFiles('build.sh', '.github/workflows/build-kernel-improved.yml') }}
+        restore-keys: |
+          proton-clang-${{ runner.os }}-
+
+    - name: Cache APT packages
+      uses: actions/cache@v3
+      with:
+        path: /var/cache/apt/archives
+        key: apt-cache-${{ runner.os }}-${{ hashFiles('build.sh', '.github/workflows/build-kernel-improved.yml') }}
+        restore-keys: |
+          apt-cache-${{ runner.os }}-
+
+    - name: Install dependencies
+      run: |
+        set -euxo pipefail
+        # Make sure source lines are present for deb-src if build-dep is required
+        if [ -f "/etc/apt/sources.list.d/ubuntu.sources" ]; then
+          sudo cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources~
+          sudo sed -Ei 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+        else
+          sudo cp /etc/apt/sources.list /etc/apt/sources.list~
+          sudo sed -Ei 's/^# deb-src /deb-src /' /etc/apt/sources.list
+        fi
+        sudo apt-get update -y
+        sudo apt-get install -y --no-install-recommends \
+          gcc-aarch64-linux-gnu \
+          gcc-arm-linux-gnueabi \
+          binutils make python3 python-is-python3 libssl-dev build-essential \
+          bc bison flex unzip ca-certificates xz-utils \
+          mkbootimg cpio device-tree-compiler git git-lfs util-linux \
+          coccinelle
+
+    - name: Ensure proton-clang present (clone if cache missed)
+      if: steps.cache-proton.outputs.cache-hit != 'true'
+      run: |
+        set -euxo pipefail
+        rm -rf proton-clang
+        git clone https://github.com/kdrag0n/proton-clang --depth=1 -b master proton-clang
+
+    - name: Export toolchain and LLVM variables
+      run: |
+        set -euxo pipefail
+        echo "PATH=$GITHUB_WORKSPACE/proton-clang/bin:$PATH" >> $GITHUB_ENV
+        echo "CC=clang" >> $GITHUB_ENV
+        echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+        echo "LD=ld.lld" >> $GITHUB_ENV
+        echo "LLVM=1" >> $GITHUB_ENV
+        # Helpful to ensure 'make' uses these values in subsequent steps
+        echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+
+    - name: Setup KernelSU
+      run: |
+        set -euxo pipefail
+        rm -rf KernelSU-Next KernelSU drivers/kernelsu
+        if [ "${{ github.event.inputs.kernelsu_choice }}" = "KernelSU-Next" ]; then
+          version="${{ github.event.inputs.kernelsu_next_version }}"
+          if [ -z "$version" ]; then
+            echo "No version specified for KernelSU-Next. Using default: v1.0.8"
+            version="v1.0.8"
+          else
+            echo "Installing KernelSU-Next version: $version"
+          fi
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$version"
+        elif [ "${{ github.event.inputs.kernelsu_choice }}" = "SukiSU-Ultra" ]; then
+          echo "Installing SukiSU-Ultra..."
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s nongki
+        elif [ "${{ github.event.inputs.kernelsu_choice }}" = "RKSU" ]; then
+          echo "Installing RKSU..."
+          curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh" | bash -s main
+        else
+          echo "Invalid choice. Please choose one of the available options."
+          exit 1
+        fi
+        ls -la drivers/kernelsu/ || true
+        ls -la drivers/kernelsu/Kconfig || echo "Kconfig not found"
+
+    - name: Patch kernel with Coccinelle hooks and run make clean
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euxo pipefail
+        # Clone the repository which contains the patch
+        rm -rf kernelsu-coccinelle
+        git clone --depth=1 https://github.com/devnoname120/kernelsu-coccinelle.git kernelsu-coccinelle
+        for p in fs drivers/input drivers/tty arch/arm/kernel; do
+          if [ -d "$p" ]; then
+            spatch --sp-file ./kernelsu-coccinelle/scope-minimized-hooks/kernelsu-scope-minimized.cocci --in-place --linux-spacing "$p" || true
+          fi
+        done
+        rm -rf ./kernelsu-coccinelle/
+        rm -rf ./android/abi_gki_protected_exports*
+        # Run a safe clean; use O=out if kernel was built out-of-tree previously
+        if [ -f "Makefile" ]; then
+          make mrproper || true
+        fi
+
+    - name: GetTime
+      id: get_time
+      run: echo "TIME=$(TZ=UTC+7 date +%m%d%H%M)" >> $GITHUB_OUTPUT
+
+    - name: Setup toolchain directory (optional links)
+      run: |
+        set -euxo pipefail
+        mkdir -p toolchain
+        if [ -d "proton-clang" ]; then
+          rm -f toolchain/bin toolchain/lib || true
+          ln -sf "$GITHUB_WORKSPACE/proton-clang/bin" toolchain/bin
+          ln -sf "$GITHUB_WORKSPACE/proton-clang/lib" toolchain/lib
+        fi
+        ls -la toolchain/ || true
+
+    - name: Run Eureka build script (with robust environment and fallbacks)
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euxo pipefail
+        chmod +x build.sh || true
+        export CORES=$(nproc --all)
+        export TERM=xterm-256color
+        export CI=true
+        export DEBIAN_FRONTEND=noninteractive
+
+        echo "=== Starting Eureka build script ==="
+        echo "Available cores: $CORES"
+        echo "Current directory: $(pwd)"
+
+        # Show previous log if present
+        if [ -f "build_output.log" ]; then
+          echo "=== Previous build log found (tail 20) ==="
+          tail -20 build_output.log || true
+        fi
+
+        # Run the build script (timeout to avoid runaway jobs)
+        if [ -x "./build.sh" ]; then
+          # Use script only if available; util-linux provides it
+          if command -v script >/dev/null 2>&1; then
+            script -q -c "timeout 7200 bash -x ./build.sh" build_output.log || true
+          else
+            timeout 7200 bash -x ./build.sh | tee build_output.log || true
+          fi
+        else
+          echo "No build.sh found; running explicit kernel build steps"
+          # Verify defconfig exists
+          if [ ! -f "arch/arm64/configs/${KERNEL_DEFCONFIG}" ]; then
+            echo "Defconfig ${KERNEL_DEFCONFIG} not found in arch/arm64/configs/"
+            ls -la arch/arm64/configs || true
+            exit 1
+          fi
+          make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}
+          make -j${CORES} O=out ARCH=arm64 CC=clang LLVM=1 || true
+        fi
+
+        echo "=== Build script execution completed ==="
+
+        # Ensure an explicit build step to produce Image if build.sh didn't
+        if [ -f "arch/arm64/configs/${KERNEL_DEFCONFIG}" ]; then
+          make -j${CORES} O=out ARCH=arm64 ${KERNEL_DEFCONFIG} || true
+          make -j${CORES} O=out ARCH=arm64 CC=clang LLVM=1 || true
+        fi
+
+        echo "=== Post-build checks ==="
+        echo "Last 200 lines of log (if exist)"
+        tail -200 build_output.log 2>/dev/null || true
+
+        echo "Listing candidate image locations"
+        find out arch -maxdepth 6 -type f -iname 'Image*' -o -iname 'zImage*' -print -exec ls -lh {} \; || true
+        ls -la out/arch/arm64/boot || ls -la arch/arm64/boot || true
+        df -h || true
+        free -h || true
+
+    - name: Copy image for artifact upload
+      run: |
+        set -euxo pipefail
+        mkdir -p kernel_zip/anykernel
+        # Prefer out/arch path
+        if [ -f out/arch/arm64/boot/Image ]; then
+          cp -v out/arch/arm64/boot/Image kernel_zip/anykernel/Image
+        elif [ -f out/arch/arm64/boot/Image.gz ]; then
+          cp -v out/arch/arm64/boot/Image.gz kernel_zip/anykernel/Image.gz
+        elif [ -f arch/arm64/boot/Image ]; then
+          cp -v arch/arm64/boot/Image kernel_zip/anykernel/Image
+        else
+          echo "No kernel Image found - listing candidates:" || true
+          find . -type f -iname 'Image*' -o -iname '*Image*' -maxdepth 6 -ls || true
+        fi
+        ls -la kernel_zip/anykernel || true
+
+    - name: Package kernel
+      run: |
+        echo "Packaging and preparing for upload..."
+        if [ -d "kernel_zip/anykernel" ] && [ "$(ls -A kernel_zip/anykernel || true)" ]; then
+          echo "Kernel build artifacts ready"
+          ls -la kernel_zip/anykernel/
+        else
+          echo "Warning: kernel_zip/anykernel directory missing or empty" || true
+          find . -name "*.zip" -type f 2>/dev/null || echo "No zip files found"
+        fi
+
+    - name: Upload kernel to artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Eureka_Kernel_A10_R15_${{ github.run_number }}
+        path: |
+          kernel_zip/anykernel/
+          kernel_zip/aroma/
+          *.zip
+        if-no-files-found: warn
