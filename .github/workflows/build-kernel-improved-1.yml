@@ -1,0 +1,278 @@
+name: Improved Build Kernel with Eureka Script
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernelsu_choice:
+        description: 'Choose which KernelSU version to install'
+        required: true
+        type: choice
+        options:
+          - 'KernelSU-Next'
+          - 'SukiSU-Ultra'
+          - 'RKSU'
+        default: 'KernelSU-Next'
+      kernelsu_next_version:
+        description: 'Enter KernelSU-Next version (e.g., v1.0.8). Leave blank for latest.'
+        required: false
+        default: 'v1.0.8'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180 # safety net so a hung/looping build doesn't run forever
+
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_MAXSIZE: "2G"
+      CCACHE_HARDLINK: "true"
+      # Verify the defconfig filename in arch/arm64/configs/ and update if needed
+      KERNEL_DEFCONFIG: "exynos7885-a10_defconfig"
+      ARCH: arm64
+      SUBARCH: arm64
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Initialize submodules
+      run: git submodule update --init --recursive
+
+    - name: Cache proton-clang
+      uses: actions/cache@v4
+      id: cache-proton
+      with:
+        path: proton-clang
+        key: proton-clang-${{ runner.os }}-${{ hashFiles('build.sh') }}
+        restore-keys: |
+          proton-clang-${{ runner.os }}-
+
+    - name: Cache APT packages
+      uses: actions/cache@v4
+      with:
+        path: /var/cache/apt/archives
+        key: apt-cache-${{ runner.os }}-v2
+        restore-keys: |
+          apt-cache-${{ runner.os }}-
+
+    - name: Cache ccache
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/.ccache
+        key: ccache-${{ runner.os }}-${{ env.KERNEL_DEFCONFIG }}-${{ github.run_id }}
+        restore-keys: |
+          ccache-${{ runner.os }}-${{ env.KERNEL_DEFCONFIG }}-
+
+    - name: Install dependencies
+      run: |
+        set -euxo pipefail
+        # Make sure source lines are present for deb-src if build-dep is required
+        if [ -f "/etc/apt/sources.list.d/ubuntu.sources" ]; then
+          sudo cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources~
+          sudo sed -Ei 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+        else
+          sudo cp /etc/apt/sources.list /etc/apt/sources.list~
+          sudo sed -Ei 's/^# deb-src /deb-src /' /etc/apt/sources.list
+        fi
+        sudo apt-get update -y
+        sudo apt-get install -y --no-install-recommends \
+          gcc-aarch64-linux-gnu \
+          gcc-arm-linux-gnueabi \
+          binutils make python3 python-is-python3 libssl-dev build-essential \
+          bc bison flex unzip ca-certificates xz-utils \
+          mkbootimg cpio device-tree-compiler git git-lfs util-linux \
+          coccinelle ccache zip
+
+    - name: Ensure proton-clang present (clone if cache missed)
+      if: steps.cache-proton.outputs.cache-hit != 'true'
+      run: |
+        set -euxo pipefail
+        rm -rf proton-clang
+        git clone https://github.com/kdrag0n/proton-clang --depth=1 -b master proton-clang
+
+    - name: Export toolchain and LLVM variables
+      run: |
+        set -euxo pipefail
+        echo "$GITHUB_WORKSPACE/proton-clang/bin" >> "$GITHUB_PATH"
+        # ccache wraps clang so repeat builds reuse object files.
+        echo "CC=ccache clang" >> "$GITHUB_ENV"
+        echo "CROSS_COMPILE=aarch64-linux-gnu-" >> "$GITHUB_ENV"
+        # THE FIX: required for the 32-bit compat vDSO on this kernel version,
+        # or arch/arm64/Makefile aborts the build with a fatal "Stop." error.
+        # (Kernels 4.19+ use CROSS_COMPILE_COMPAT instead of this variable
+        # name -- check arch/arm64/Makefile if you're not sure which base
+        # this tree is on.)
+        echo "CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> "$GITHUB_ENV"
+        echo "LD=ld.lld" >> "$GITHUB_ENV"
+        echo "LLVM=1" >> "$GITHUB_ENV"
+
+    - name: Setup KernelSU
+      run: |
+        set -euxo pipefail
+        rm -rf KernelSU-Next KernelSU drivers/kernelsu
+        if [ "${{ github.event.inputs.kernelsu_choice }}" = "KernelSU-Next" ]; then
+          version="${{ github.event.inputs.kernelsu_next_version }}"
+          if [ -z "$version" ]; then
+            echo "No version specified for KernelSU-Next. Using default: v1.0.8"
+            version="v1.0.8"
+          else
+            echo "Installing KernelSU-Next version: $version"
+          fi
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$version"
+        elif [ "${{ github.event.inputs.kernelsu_choice }}" = "SukiSU-Ultra" ]; then
+          echo "Installing SukiSU-Ultra..."
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s nongki
+        elif [ "${{ github.event.inputs.kernelsu_choice }}" = "RKSU" ]; then
+          echo "Installing RKSU..."
+          curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh" | bash -s main
+        else
+          echo "Invalid choice. Please choose one of the available options."
+          exit 1
+        fi
+        ls -la drivers/kernelsu/
+        ls -la drivers/kernelsu/Kconfig
+
+    - name: Patch kernel with Coccinelle hooks and run make clean
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euxo pipefail
+        # Clone the repository which contains the patch
+        rm -rf kernelsu-coccinelle
+        git clone --depth=1 https://github.com/devnoname120/kernelsu-coccinelle.git kernelsu-coccinelle
+        for p in fs drivers/input drivers/tty arch/arm/kernel; do
+          if [ -d "$p" ]; then
+            spatch --sp-file ./kernelsu-coccinelle/scope-minimized-hooks/kernelsu-scope-minimized.cocci --in-place --linux-spacing "$p" || true
+          fi
+        done
+        rm -rf ./kernelsu-coccinelle/
+        rm -rf ./android/abi_gki_protected_exports*
+        # Run a safe clean; use O=out if kernel was built out-of-tree previously
+        if [ -f "Makefile" ]; then
+          make mrproper || true
+        fi
+
+    - name: GetTime
+      id: get_time
+      run: echo "TIME=$(TZ=UTC+7 date +%m%d%H%M)" >> "$GITHUB_OUTPUT"
+
+    - name: Setup toolchain directory (optional links)
+      run: |
+        set -euxo pipefail
+        mkdir -p toolchain
+        if [ -d "proton-clang" ]; then
+          rm -f toolchain/bin toolchain/lib || true
+          ln -sf "$GITHUB_WORKSPACE/proton-clang/bin" toolchain/bin
+          ln -sf "$GITHUB_WORKSPACE/proton-clang/lib" toolchain/lib
+        fi
+        ls -la toolchain/
+
+    - name: Run Eureka build script (with robust environment and fallbacks)
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euxo pipefail
+        chmod +x build.sh || true
+        export CORES=$(nproc --all)
+        export TERM=xterm-256color
+        export CI=true
+        export DEBIAN_FRONTEND=noninteractive
+
+        echo "=== Starting Eureka build script ==="
+        echo "Available cores: $CORES"
+        echo "CC=$CC  CROSS_COMPILE=$CROSS_COMPILE  CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32  LLVM=$LLVM"
+
+        # Run build.sh but actually capture whether it succeeded, instead
+        # of unconditionally swallowing its exit code.
+        build_status=0
+        if [ -x "./build.sh" ]; then
+          set +e
+          if command -v script >/dev/null 2>&1; then
+            script -q -e -c "timeout 7200 bash -x ./build.sh" build_output.log
+          else
+            timeout 7200 bash -x ./build.sh 2>&1 | tee build_output.log
+          fi
+          build_status=$?
+          set -e
+          echo "build.sh exited with status $build_status"
+        else
+          echo "No build.sh found; will run explicit kernel build steps"
+        fi
+
+        # Only fall back to a manual build if build.sh is absent or truly
+        # produced no Image -- previously this ran unconditionally and could
+        # silently wipe out an Image that build.sh had already built.
+        image_already_present="$(find out arch -maxdepth 6 -type f \
+          \( -iname 'Image' -o -iname 'Image.gz' -o -iname 'Image.gz-dtb' \
+             -o -iname 'Image-dtb' -o -iname 'Image.lz4' \) \
+          2>/dev/null | head -n1)"
+
+        if [ -n "$image_already_present" ]; then
+          echo "=== build.sh already produced $image_already_present, skipping fallback build ==="
+        else
+          echo "=== No Image found (build.sh absent, or exited $build_status without producing one) -- running manual build ==="
+          if [ ! -f "arch/arm64/configs/${KERNEL_DEFCONFIG}" ]; then
+            echo "::error::Defconfig ${KERNEL_DEFCONFIG} not found in arch/arm64/configs/"
+            ls -la arch/arm64/configs
+            exit 1
+          fi
+          make O=out ARCH=arm64 "${KERNEL_DEFCONFIG}"
+          make -j"${CORES}" O=out ARCH=arm64 \
+            CC="ccache clang" CROSS_COMPILE="${CROSS_COMPILE}" \
+            CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" LLVM=1
+        fi
+
+        echo "=== Post-build diagnostics ==="
+        echo "Last 150 lines of build log (if present):"
+        tail -150 build_output.log 2>/dev/null || true
+        echo "Candidate image files:"
+        find out arch -maxdepth 6 -type f -iname '*Image*' -exec ls -lh {} \; 2>/dev/null || true
+        df -h
+        ccache -s || true
+
+    - name: Copy image for artifact upload
+      run: |
+        set -euxo pipefail
+        mkdir -p kernel_zip/anykernel
+
+        # Broad search: different signing/DT setups produce different names.
+        image_path="$(find out arch -maxdepth 6 -type f \
+          \( -iname 'Image' -o -iname 'Image.gz' -o -iname 'Image.gz-dtb' \
+             -o -iname 'Image-dtb' -o -iname 'Image.lz4' \) \
+          2>/dev/null | head -n1)"
+
+        if [ -z "$image_path" ]; then
+          echo "::error::No kernel Image was produced. Scroll up to the 'Run Eureka build script' step and search its log for 'error:' or 'Stop.' -- that's the real failure, not this step."
+          echo "Full directory listing for debugging:"
+          find out arch -maxdepth 6 -type f \( -iname '*Image*' -o -iname '*.dtb' \) 2>/dev/null || true
+          exit 1
+        fi
+
+        echo "Found kernel image: $image_path"
+        cp -v "$image_path" "kernel_zip/anykernel/$(basename "$image_path")"
+        ls -la kernel_zip/anykernel
+
+    - name: Package kernel
+      run: |
+        set -euxo pipefail
+        echo "Kernel build artifacts ready:"
+        ls -la kernel_zip/anykernel/
+        # NOTE: this only stages the raw Image -- it does not build a
+        # flashable AnyKernel3 zip. If you want a flashable zip instead of
+        # a bare Image file, add a step here that clones your device's
+        # AnyKernel3 template (with its own anykernel.sh), drops the Image
+        # in, and zips it. Happy to add that if you share which template
+        # repo you use.
+
+    - name: Upload kernel to artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Eureka_Kernel_A10_R15_${{ github.run_number }}_${{ steps.get_time.outputs.TIME }}
+        path: |
+          kernel_zip/anykernel/
+          kernel_zip/aroma/
+          *.zip
+        if-no-files-found: warn
